@@ -1,0 +1,243 @@
+services:
+
+  frontend:
+    build:
+      context: ./Frontend  # Répertoire où se trouve ton Dockerfile pour le frontend
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    env_file:
+      - path: .env  # Charge les variables d'environnement
+        required: true
+    networks:
+      - transcendence
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:80"]
+      interval: 2s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - logs:/mnt/logs  # Persistance des logs
+
+
+  nginx:
+    build:
+      context: ./Nginx  # Répertoire où se trouve ton Dockerfile pour Nginx
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    ports:
+      - "8443:8443"  # Expose Nginx sur le port HTTPS (443)
+    networks:
+      - transcendence
+    env_file:
+      - path: .env  # Charge les variables d'environnement
+        required: true
+    restart: always
+    depends_on:
+      frontend:  # Assure-toi que le frontend est démarré avant Nginx
+        condition: service_healthy
+      postgres:  # Assure-toi que PostgreSQL est démarré avant Nginx
+        condition: service_healthy
+      api:  # Assure-toi que l'API est démarrée avant Nginx
+        condition: service_healthy
+      kibana:
+        condition: service_started
+      grafana:  # Assure-toi que le frontend est démarré avant Nginx
+        condition: service_started
+    volumes:
+      - logs:/mnt/logs  # Persistance des logs
+      - media_data:/mnt/media  # Montage des fichiers média
+
+
+  postgres:
+    build:
+      context: ./PostgreSQL  # Répertoire où se trouve ton Dockerfile pour PostgreSQL
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    networks:
+      - transcendence
+    environment:
+      - POSTGRES_LOGGING_COLLECTOR=on
+      - POSTGRES_LOG_DIRECTORY=/mnt/logs/postgresql
+      - POSTGRES_LOG_FILENAME=postgresql.log
+    env_file:
+      - .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persistance des données
+      - logs:/mnt/logs  # Persistance des logs
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432", "-t", "2", "-U", "postgres"]
+      interval: 2s
+      retries: 20
+    restart: always #should be always
+
+
+  api:
+    build:
+      context: ./Backend_API  # Répertoire où se trouve ton Dockerfile pour l'API
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    networks:
+      - transcendence
+    restart: always #should be always
+    env_file:
+      - path: .env  # Charge les variables d'environnement
+        required: true
+    volumes:
+      - media_data:/app/media  # Persistance des fichiers média
+      - logs:/mnt/logs  # Persistance des logs
+    depends_on:
+      postgres:  # Assure-toi que PostgreSQL est démarré avant l'API
+        condition: service_healthy
+    healthcheck:
+      test: "wget -o/dev/null -q http://localhost:8000/api/register/ ; test $? = 8 "
+      interval: 1s
+      retries: 10
+
+
+  prometheus:
+    build:
+      context: ./Prometheus  # Répertoire où se trouve ton Dockerfile pour Prometheus
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    networks:
+      - transcendence
+    volumes:
+      - prometheus_data:/prometheus-xyzabc  # Monte le fichier de configuration
+
+
+  grafana:
+    build:
+      context: ./Grafana  # Répertoire où se trouve ton Dockerfile pour Grafana
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    networks:
+      - transcendence
+    environment:
+      - GF_INSTALL_PLUGINGS=grafana-clock-panel,grafana-simple-json-datasource
+    depends_on:
+      - prometheus  # Assure-toi que Prometheus est démarré avant Grafana
+    volumes:
+      - grafana_data:/var/lib/grafana  # Persistance des données
+      - ./Grafana/provisioning:/etc/grafana/provisioning
+      - ./Grafana/dashboard.json:/var/lib/grafana/dashboards/dashboard.json
+
+
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    networks:
+      - transcendence
+
+
+  elasticsearch:
+    stop_grace_period: 1s
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.16.1
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false # Sécurité activée
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD} # Mot de passe pour l'accès
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g # Configuration de la mémoire
+    volumes:
+      - es_data:/usr/share/elasticsearch/data # Données persistantes
+    networks:
+      - transcendence
+
+
+  logstash:
+    build:
+      context: ./Logstash  # Répertoire où se trouve ton Dockerfile pour Logstash
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      - ./Logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    networks:
+      - transcendence
+    depends_on:
+      - elasticsearch
+
+
+  filebeat:
+    build:
+      context: ./Filebeat  # Répertoire où se trouve ton Dockerfile pour Filebeat
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    volumes:
+      - ./Filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml
+      - logs:/mnt/logs  # Persistance des logs
+    environment:
+      - "ELASTICSEARCH_HOST=${ELASTICSEARCH_HOST}"
+    networks:
+      - transcendence
+    depends_on:
+      - logstash
+      - elasticsearch
+
+
+  kibana:
+    stop_grace_period: 15s
+    build:
+      context: ./Kibana  # Répertoire où se trouve ton Dockerfile pour Kibana
+      dockerfile: Dockerfile  # Nom du Dockerfile
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - transcendence
+    depends_on:
+      - elasticsearch
+
+
+volumes:
+  postgres_data:  # Volume pour stocker les données PostgreSQL
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/postgresql
+      o: bind
+
+  media_data:  # Volume pour stocker les fichiers média
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/media
+      o: bind
+
+  prometheus_data:  # Volume pour stocker les données Prometheus
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/prometheus
+      o: bind
+
+  grafana_data:  # Volume pour stocker les données Grafana
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/grafana
+      o: bind
+
+  es_data:  # Volume pour stocker les données Elasticsearch
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/elasticsearch
+      o: bind
+
+  logstash_data:  # Volume pour les données temporaires ou persistantes de Logstash
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/logstash/data
+      o: bind
+
+  logstash_logs:  # Volume pour les logs internes de Logstash
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/logstash/logs
+      o: bind
+
+  filebeat_data:  # Volume pour l'état interne de Filebeat
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/filebeat
+      o: bind
+
+  logs:  # Volume partagé pour les logs des services
+    driver_opts:
+      type: none
+      device: ${HOME}/transcendence/logs
+      o: bind
+
+
+networks:
+  transcendence:  # Crée un réseau dédié pour tous les services
+    driver: bridge
